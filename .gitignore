@@ -1,3 +1,4 @@
 target/
 www/pkg/
 
+node_modules/
