@@ -1,0 +1,8 @@
+{
+  "name": "rust-breakout",
+  "private": true,
+  "scripts": {
+    "dev": "./dev.sh",
+    "build": "wasm-pack build --target web --out-dir www/pkg"
+  }
+}
