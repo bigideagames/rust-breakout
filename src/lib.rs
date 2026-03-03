@@ -1,32 +1,36 @@
-mod fixed;
-
-use fixed::{ensure_sin_lut, fixed_cos, fixed_sin, Fixed, FRAC_SCALE};
+use fixed::types::I32F32;
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
 // ============================================================================
+// Fixed-point type alias (s32.32 — matches FixPointCS Fixed64)
+// ============================================================================
+
+type Fp = I32F32;
+
+// ============================================================================
 // Game Constants (all Fixed-point)
 // ============================================================================
 
-fn canvas_width() -> Fixed { Fixed::from_i32(800) }
-fn canvas_height() -> Fixed { Fixed::from_i32(600) }
-fn paddle_width() -> Fixed { Fixed::from_i32(120) }
-fn paddle_height() -> Fixed { Fixed::from_i32(14) }
-fn paddle_y() -> Fixed { canvas_height() - Fixed::from_i32(40) }
-fn paddle_speed() -> Fixed { Fixed::from_i32(600) }
-fn ball_radius() -> Fixed { Fixed::from_i32(8) }
-fn ball_initial_speed() -> Fixed { Fixed::from_i32(350) }
-fn ball_speed_increment() -> Fixed { Fixed::from_i32(8) }
-fn ball_max_speed() -> Fixed { Fixed::from_i32(700) }
-fn brick_width() -> Fixed { Fixed::from_i32(58) }
-fn brick_height() -> Fixed { Fixed::from_i32(22) }
-fn brick_padding() -> Fixed { Fixed::from_i32(6) }
-fn brick_offset_top() -> Fixed { Fixed::from_i32(60) }
-fn brick_offset_left() -> Fixed {
-    let total = Fixed::from_i32(BRICK_COLS as i32) * (brick_width() + brick_padding()) - brick_padding();
-    (canvas_width() - total) / Fixed::TWO
+fn canvas_width() -> Fp { Fp::from_num(800) }
+fn canvas_height() -> Fp { Fp::from_num(600) }
+fn paddle_width() -> Fp { Fp::from_num(120) }
+fn paddle_height() -> Fp { Fp::from_num(14) }
+fn paddle_y() -> Fp { canvas_height() - Fp::from_num(40) }
+fn paddle_speed() -> Fp { Fp::from_num(600) }
+fn ball_radius() -> Fp { Fp::from_num(8) }
+fn ball_initial_speed() -> Fp { Fp::from_num(350) }
+fn ball_speed_increment() -> Fp { Fp::from_num(8) }
+fn ball_max_speed() -> Fp { Fp::from_num(700) }
+fn brick_width() -> Fp { Fp::from_num(58) }
+fn brick_height() -> Fp { Fp::from_num(22) }
+fn brick_padding() -> Fp { Fp::from_num(6) }
+fn brick_offset_top() -> Fp { Fp::from_num(60) }
+fn brick_offset_left() -> Fp {
+    let total = Fp::from_num(BRICK_COLS as i32) * (brick_width() + brick_padding()) - brick_padding();
+    (canvas_width() - total) / Fp::from_num(2)
 }
 
 const BALL_TRAIL_LENGTH: usize = 12;
@@ -43,63 +47,76 @@ const ROW_GLOW: [&str; 6] = [
     "rgba(51,255,102,0.5)", "rgba(51,204,255,0.5)", "rgba(153,102,255,0.5)",
 ];
 
+// Fixed-point constants
+fn fp_zero() -> Fp { Fp::from_num(0) }
+fn fp_one() -> Fp { Fp::from_num(1) }
+fn fp_two() -> Fp { Fp::from_num(2) }
+fn fp_half() -> Fp { Fp::from_num(0.5) }
+fn fp_tau() -> Fp { Fp::from_num(std::f64::consts::TAU) }
+fn fp_frac_pi_2() -> Fp { Fp::from_num(std::f64::consts::FRAC_PI_2) }
+fn fp_frac_pi_3() -> Fp { Fp::from_num(std::f64::consts::FRAC_PI_3) }
+fn fp_frac_pi_4() -> Fp { Fp::from_num(std::f64::consts::FRAC_PI_4) }
+
 // ============================================================================
 // Game Types
 // ============================================================================
 
 #[derive(Clone, Copy)]
-struct Vec2 { x: Fixed, y: Fixed }
+struct Vec2 { x: Fp, y: Fp }
 
 impl Vec2 {
-    fn new(x: Fixed, y: Fixed) -> Self { Self { x, y } }
+    fn new(x: Fp, y: Fp) -> Self { Self { x, y } }
 
     fn normalize(&self) -> Self {
         let len_sq = self.x * self.x + self.y * self.y;
-        if len_sq == Fixed::ZERO { return *self; }
-        let len = len_sq.sqrt();
+        if len_sq == fp_zero() { return *self; }
+        let len = cordic::sqrt(len_sq);
         Self { x: self.x / len, y: self.y / len }
     }
 }
 
 #[derive(Clone, Copy)]
-struct Brick { x: Fixed, y: Fixed, alive: bool, row: usize }
+struct Brick { x: Fp, y: Fp, alive: bool, row: usize }
 
 #[derive(Clone, Copy)]
 struct Particle {
-    x: Fixed, y: Fixed, vx: Fixed, vy: Fixed,
-    life: Fixed, max_life: Fixed, size: Fixed,
+    x: Fp, y: Fp, vx: Fp, vy: Fp,
+    life: Fp, max_life: Fp, size: Fp,
     color_index: usize, active: bool,
 }
 
 impl Particle {
     fn new() -> Self {
         Self {
-            x: Fixed::ZERO, y: Fixed::ZERO,
-            vx: Fixed::ZERO, vy: Fixed::ZERO,
-            life: Fixed::ZERO, max_life: Fixed::ZERO,
-            size: Fixed::ZERO, color_index: 0, active: false,
+            x: fp_zero(), y: fp_zero(),
+            vx: fp_zero(), vy: fp_zero(),
+            life: fp_zero(), max_life: fp_zero(),
+            size: fp_zero(), color_index: 0, active: false,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct Trail { x: Fixed, y: Fixed, alpha: Fixed }
+struct Trail { x: Fp, y: Fp, alpha: Fp }
 
 #[derive(PartialEq, Clone, Copy)]
 enum GameState { Wait, Play, Over, Won }
 
 // ============================================================================
-// Pseudo-Random Number Generator (returns Fixed in [0, 1))
+// Pseudo-Random Number Generator (returns Fp in [0, 1))
 // ============================================================================
 
-fn prand(seed: u64) -> Fixed {
+fn prand(seed: u64) -> Fp {
     let mut v = seed
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     v ^= v >> 22;
     v ^= v << 13;
     v ^= v >> 8;
-    Fixed::from_raw((v % 10000) as i64 * FRAC_SCALE / 10000)
+    // Return a value in [0, 1): (v % 10000) / 10000
+    let numerator = Fp::from_num((v % 10000) as i32);
+    let denominator = Fp::from_num(10000);
+    numerator / denominator
 }
 
 // ============================================================================
@@ -107,10 +124,10 @@ fn prand(seed: u64) -> Fixed {
 // ============================================================================
 
 struct Game {
-    paddle_x: Fixed,
+    paddle_x: Fp,
     ball_pos: Vec2,
     ball_vel: Vec2,
-    ball_speed: Fixed,
+    ball_speed: Fp,
     bricks: Vec<Brick>,
     particles: Vec<Particle>,
     trail: Vec<Trail>,
@@ -128,12 +145,12 @@ struct Game {
 impl Game {
     fn new() -> Self {
         let mut game = Game {
-            paddle_x: canvas_width() / Fixed::TWO - paddle_width() / Fixed::TWO,
+            paddle_x: canvas_width() / fp_two() - paddle_width() / fp_two(),
             ball_pos: Vec2::new(
-                canvas_width() / Fixed::TWO,
-                paddle_y() - ball_radius() - Fixed::TWO,
+                canvas_width() / fp_two(),
+                paddle_y() - ball_radius() - fp_two(),
             ),
-            ball_vel: Vec2::new(Fixed::ZERO, Fixed::ZERO),
+            ball_vel: Vec2::new(fp_zero(), fp_zero()),
             ball_speed: ball_initial_speed(),
             bricks: Vec::new(),
             particles: vec![Particle::new(); MAX_PARTICLES],
@@ -158,8 +175,8 @@ impl Game {
         let bp = brick_padding();
         for row in 0..BRICK_ROWS {
             for col in 0..BRICK_COLS {
-                let x = ol + Fixed::from_i32(col as i32) * (bw + bp);
-                let y = ot + Fixed::from_i32(row as i32) * (bh + bp);
+                let x = ol + Fp::from_num(col as i32) * (bw + bp);
+                let y = ot + Fp::from_num(row as i32) * (bh + bp);
                 self.bricks.push(Brick { x, y, alive: true, row });
             }
         }
@@ -167,12 +184,12 @@ impl Game {
     }
 
     fn reset(&mut self) {
-        self.paddle_x = canvas_width() / Fixed::TWO - paddle_width() / Fixed::TWO;
+        self.paddle_x = canvas_width() / fp_two() - paddle_width() / fp_two();
         self.ball_pos = Vec2::new(
-            canvas_width() / Fixed::TWO,
-            paddle_y() - ball_radius() - Fixed::TWO,
+            canvas_width() / fp_two(),
+            paddle_y() - ball_radius() - fp_two(),
         );
-        self.ball_vel = Vec2::new(Fixed::ZERO, Fixed::ZERO);
+        self.ball_vel = Vec2::new(fp_zero(), fp_zero());
         self.ball_speed = ball_initial_speed();
         self.score = 0; self.lives = MAX_LIVES; self.bricks_broken = 0;
         self.state = GameState::Wait;
@@ -183,42 +200,40 @@ impl Game {
 
     fn launch(&mut self) {
         let r = prand(self.frame_count);
-        let qp = Fixed::from_f64(std::f64::consts::FRAC_PI_4);
-        let hp = Fixed::from_f64(std::f64::consts::FRAC_PI_2);
-        let angle = -qp + r * hp;
-        self.ball_vel = Vec2::new(fixed_sin(angle), -fixed_cos(angle));
+        let angle = -fp_frac_pi_4() + r * fp_frac_pi_2();
+        self.ball_vel = Vec2::new(cordic::sin(angle), -cordic::cos(angle));
         self.state = GameState::Play;
     }
 
     fn reset_ball(&mut self) {
         self.ball_pos = Vec2::new(
-            self.paddle_x + paddle_width() / Fixed::TWO,
-            paddle_y() - ball_radius() - Fixed::TWO,
+            self.paddle_x + paddle_width() / fp_two(),
+            paddle_y() - ball_radius() - fp_two(),
         );
-        self.ball_vel = Vec2::new(Fixed::ZERO, Fixed::ZERO);
+        self.ball_vel = Vec2::new(fp_zero(), fp_zero());
         self.ball_speed = (ball_initial_speed()
-            + Fixed::from_i32(self.bricks_broken as i32) * (ball_speed_increment() * Fixed::HALF))
+            + Fp::from_num(self.bricks_broken as i32) * (ball_speed_increment() * fp_half()))
             .min(ball_max_speed());
         self.trail.clear();
         self.state = GameState::Wait;
     }
 
-    fn spawn_particles(&mut self, x: Fixed, y: Fixed, ci: usize, count: usize) {
-        let tau = Fixed::from_f64(std::f64::consts::TAU);
+    fn spawn_particles(&mut self, x: Fp, y: Fp, ci: usize, count: usize) {
+        let tau = fp_tau();
         let mut s = 0;
         for p in &mut self.particles {
             if !p.active && s < count {
                 let angle = prand(self.frame_count + s as u64 * 7) * tau;
-                let speed = Fixed::from_i32(50)
-                    + prand(self.frame_count + s as u64 * 13) * Fixed::from_i32(200);
+                let speed = Fp::from_num(50)
+                    + prand(self.frame_count + s as u64 * 13) * Fp::from_num(200);
                 p.x = x; p.y = y;
-                p.vx = fixed_cos(angle) * speed;
-                p.vy = fixed_sin(angle) * speed;
-                p.life = Fixed::HALF
-                    + prand(self.frame_count + s as u64 * 19) * Fixed::from_f64(0.7);
+                p.vx = cordic::cos(angle) * speed;
+                p.vy = cordic::sin(angle) * speed;
+                p.life = fp_half()
+                    + prand(self.frame_count + s as u64 * 19) * Fp::from_num(0.7);
                 p.max_life = p.life;
-                p.size = Fixed::TWO
-                    + prand(self.frame_count + s as u64 * 23) * Fixed::from_i32(4);
+                p.size = fp_two()
+                    + prand(self.frame_count + s as u64 * 23) * Fp::from_num(4);
                 p.color_index = ci;
                 p.active = true;
                 s += 1;
@@ -226,9 +241,9 @@ impl Game {
         }
     }
 
-    fn update(&mut self, dt: Fixed) {
+    fn update(&mut self, dt: Fp) {
         self.frame_count += 1;
-        let gravity = Fixed::from_i32(150);
+        let gravity = Fp::from_num(150);
 
         // Update particles
         for p in &mut self.particles {
@@ -237,14 +252,14 @@ impl Game {
                 p.y += p.vy * dt;
                 p.vy += gravity * dt;
                 p.life -= dt;
-                if p.life <= Fixed::ZERO { p.active = false; }
+                if p.life <= fp_zero() { p.active = false; }
             }
         }
 
         if self.state != GameState::Play {
             if self.state == GameState::Wait {
-                self.ball_pos.x = self.paddle_x + paddle_width() / Fixed::TWO;
-                self.ball_pos.y = paddle_y() - ball_radius() - Fixed::TWO;
+                self.ball_pos.x = self.paddle_x + paddle_width() / fp_two();
+                self.ball_pos.y = paddle_y() - ball_radius() - fp_two();
             }
             return;
         }
@@ -252,16 +267,16 @@ impl Game {
         // Paddle movement
         if self.left_pressed { self.paddle_x -= paddle_speed() * dt; }
         if self.right_pressed { self.paddle_x += paddle_speed() * dt; }
-        self.paddle_x = self.paddle_x.clamp(Fixed::ZERO, canvas_width() - paddle_width());
+        self.paddle_x = self.paddle_x.clamp(fp_zero(), canvas_width() - paddle_width());
 
         // Ball trail
-        self.trail.push(Trail { x: self.ball_pos.x, y: self.ball_pos.y, alpha: Fixed::ONE });
+        self.trail.push(Trail { x: self.ball_pos.x, y: self.ball_pos.y, alpha: fp_one() });
         if self.trail.len() > BALL_TRAIL_LENGTH { self.trail.remove(0); }
         let tl = self.trail.len();
         for (i, t) in self.trail.iter_mut().enumerate() {
-            t.alpha = Fixed::from_i32((i + 1) as i32)
-                / Fixed::from_i32(tl as i32)
-                * Fixed::from_f64(0.6);
+            t.alpha = Fp::from_num((i + 1) as i32)
+                / Fp::from_num(tl as i32)
+                * Fp::from_num(0.6);
         }
 
         // Ball movement
@@ -273,7 +288,7 @@ impl Game {
         let ch = canvas_height();
 
         // Wall collisions
-        if self.ball_pos.x - br <= Fixed::ZERO {
+        if self.ball_pos.x - br <= fp_zero() {
             self.ball_pos.x = br;
             self.ball_vel.x = self.ball_vel.x.abs();
         }
@@ -281,7 +296,7 @@ impl Game {
             self.ball_pos.x = cw - br;
             self.ball_vel.x = -self.ball_vel.x.abs();
         }
-        if self.ball_pos.y - br <= Fixed::ZERO {
+        if self.ball_pos.y - br <= fp_zero() {
             self.ball_pos.y = br;
             self.ball_vel.y = self.ball_vel.y.abs();
         }
@@ -298,18 +313,17 @@ impl Game {
         let py = paddle_y();
         let pw = paddle_width();
         let ph = paddle_height();
-        if self.ball_vel.y > Fixed::ZERO {
+        if self.ball_vel.y > fp_zero() {
             let pl = self.paddle_x;
             let pr = self.paddle_x + pw;
             if self.ball_pos.y + br >= py
-                && self.ball_pos.y + br <= py + ph + Fixed::from_i32(4)
+                && self.ball_pos.y + br <= py + ph + Fp::from_num(4)
                 && self.ball_pos.x >= pl - br
                 && self.ball_pos.x <= pr + br
             {
                 let hp = (self.ball_pos.x - pl) / pw;
-                let pi3 = Fixed::from_f64(std::f64::consts::FRAC_PI_3);
-                let angle = (hp - Fixed::HALF) * pi3 * Fixed::from_f64(2.5);
-                self.ball_vel = Vec2::new(fixed_sin(angle), -fixed_cos(angle)).normalize();
+                let angle = (hp - fp_half()) * fp_frac_pi_3() * Fp::from_num(2.5);
+                self.ball_vel = Vec2::new(cordic::sin(angle), -cordic::cos(angle)).normalize();
                 self.ball_pos.y = py - br;
             }
         }
@@ -327,14 +341,14 @@ impl Game {
             let dy = self.ball_pos.y - cy;
             if dx * dx + dy * dy <= br * br {
                 hit = Some(i);
-                let bcx = b.x + bw / Fixed::TWO;
-                let bcy = b.y + bh / Fixed::TWO;
+                let bcx = b.x + bw / fp_two();
+                let bcy = b.y + bh / fp_two();
                 let dfx = self.ball_pos.x - bcx;
                 let dfy = self.ball_pos.y - bcy;
                 if dfx.abs() / bw > dfy.abs() / bh {
-                    self.ball_vel.x = if dfx > Fixed::ZERO { self.ball_vel.x.abs() } else { -self.ball_vel.x.abs() };
+                    self.ball_vel.x = if dfx > fp_zero() { self.ball_vel.x.abs() } else { -self.ball_vel.x.abs() };
                 } else {
-                    self.ball_vel.y = if dfy > Fixed::ZERO { self.ball_vel.y.abs() } else { -self.ball_vel.y.abs() };
+                    self.ball_vel.y = if dfy > fp_zero() { self.ball_vel.y.abs() } else { -self.ball_vel.y.abs() };
                 }
                 break;
             }
@@ -346,14 +360,14 @@ impl Game {
             self.score += (BRICK_ROWS - b.row) as u32 * 10;
             self.bricks_broken += 1;
             self.ball_speed = (self.ball_speed + ball_speed_increment()).min(ball_max_speed());
-            self.spawn_particles(b.x + bw / Fixed::TWO, b.y + bh / Fixed::TWO, b.row, 15);
+            self.spawn_particles(b.x + bw / fp_two(), b.y + bh / fp_two(), b.row, 15);
             if self.bricks_broken >= self.bricks_total { self.state = GameState::Won; }
         }
     }
 
     fn draw(&self, ctx: &CanvasRenderingContext2d) {
-        let cw = canvas_width().to_f64();
-        let ch = canvas_height().to_f64();
+        let cw = canvas_width().to_num::<f64>();
+        let ch = canvas_height().to_num::<f64>();
 
         // Background
         ctx.set_fill_style_str("#0a0a2e");
@@ -368,12 +382,12 @@ impl Game {
         while gy < ch { ctx.begin_path(); ctx.move_to(0.0, gy); ctx.line_to(cw, gy); ctx.stroke(); gy += 40.0; }
 
         // Bricks
-        let bwf = brick_width().to_f64();
-        let bhf = brick_height().to_f64();
+        let bwf = brick_width().to_num::<f64>();
+        let bhf = brick_height().to_num::<f64>();
         for b in &self.bricks {
             if !b.alive { continue; }
-            let bx = b.x.to_f64();
-            let by = b.y.to_f64();
+            let bx = b.x.to_num::<f64>();
+            let by = b.y.to_num::<f64>();
             ctx.set_shadow_color(ROW_GLOW[b.row % 6]);
             ctx.set_shadow_blur(12.0);
             ctx.set_fill_style_str(ROW_COLORS[b.row % 6]);
@@ -390,38 +404,38 @@ impl Game {
         // Particles
         for p in &self.particles {
             if !p.active { continue; }
-            let a = (p.life / p.max_life).max(Fixed::ZERO).to_f64();
+            let a = (p.life / p.max_life).max(fp_zero()).to_num::<f64>();
             ctx.set_fill_style_str(&color_with_alpha(ROW_COLORS[p.color_index % 6], a));
             ctx.begin_path();
-            let _ = ctx.arc(p.x.to_f64(), p.y.to_f64(), p.size.to_f64() * a, 0.0, std::f64::consts::TAU);
+            let _ = ctx.arc(p.x.to_num::<f64>(), p.y.to_num::<f64>(), p.size.to_num::<f64>() * a, 0.0, std::f64::consts::TAU);
             ctx.fill();
         }
 
         // Trail
         for t in &self.trail {
-            let a = t.alpha.to_f64();
+            let a = t.alpha.to_num::<f64>();
             ctx.set_fill_style_str(&format!("rgba(100,200,255,{})", a * 0.4));
             ctx.begin_path();
-            let _ = ctx.arc(t.x.to_f64(), t.y.to_f64(), ball_radius().to_f64() * a, 0.0, std::f64::consts::TAU);
+            let _ = ctx.arc(t.x.to_num::<f64>(), t.y.to_num::<f64>(), ball_radius().to_num::<f64>() * a, 0.0, std::f64::consts::TAU);
             ctx.fill();
         }
 
         // Ball
-        let brf = ball_radius().to_f64();
+        let brf = ball_radius().to_num::<f64>();
         ctx.set_shadow_color("rgba(100,200,255,0.8)");
         ctx.set_shadow_blur(20.0);
         ctx.set_fill_style_str("#ffffff");
         ctx.begin_path();
-        let _ = ctx.arc(self.ball_pos.x.to_f64(), self.ball_pos.y.to_f64(), brf, 0.0, std::f64::consts::TAU);
+        let _ = ctx.arc(self.ball_pos.x.to_num::<f64>(), self.ball_pos.y.to_num::<f64>(), brf, 0.0, std::f64::consts::TAU);
         ctx.fill();
         ctx.set_shadow_blur(0.0);
         ctx.set_shadow_color("transparent");
 
         // Paddle
-        let px = self.paddle_x.to_f64();
-        let pyf = paddle_y().to_f64();
-        let pwf = paddle_width().to_f64();
-        let phf = paddle_height().to_f64();
+        let px = self.paddle_x.to_num::<f64>();
+        let pyf = paddle_y().to_num::<f64>();
+        let pwf = paddle_width().to_num::<f64>();
+        let phf = paddle_height().to_num::<f64>();
         ctx.set_shadow_color("rgba(0,212,255,0.6)");
         ctx.set_shadow_blur(15.0);
         {
@@ -449,8 +463,8 @@ impl Game {
         ctx.set_fill_style_str("rgba(255,255,255,0.3)");
         ctx.set_font("12px 'Segoe UI',Arial,sans-serif");
         let speed_range = ball_max_speed() - ball_initial_speed();
-        let speed_pct = if speed_range > Fixed::ZERO {
-            ((self.ball_speed - ball_initial_speed()) / speed_range * Fixed::from_i32(100)).to_f64() as u32
+        let speed_pct = if speed_range > fp_zero() {
+            ((self.ball_speed - ball_initial_speed()) / speed_range * Fp::from_num(100)).to_num::<f64>() as u32
         } else { 0 };
         let _ = ctx.fill_text(&format!("SPEED +{}%", speed_pct), cw / 2.0, 30.0);
         ctx.set_stroke_style_str("rgba(0,212,255,0.3)");
@@ -480,9 +494,9 @@ impl Game {
         }
     }
 
-    fn mouse_move(&mut self, x: Fixed) {
+    fn mouse_move(&mut self, x: Fp) {
         if self.state == GameState::Play || self.state == GameState::Wait {
-            self.paddle_x = (x - paddle_width() / Fixed::TWO).clamp(Fixed::ZERO, canvas_width() - paddle_width());
+            self.paddle_x = (x - paddle_width() / fp_two()).clamp(fp_zero(), canvas_width() - paddle_width());
         }
     }
 
@@ -541,8 +555,8 @@ fn color_with_alpha(hex: &str, alpha: f64) -> String {
 }
 
 fn draw_overlay(ctx: &CanvasRenderingContext2d, title: &str, sub: &str) {
-    let cw = canvas_width().to_f64();
-    let ch = canvas_height().to_f64();
+    let cw = canvas_width().to_num::<f64>();
+    let ch = canvas_height().to_num::<f64>();
     ctx.set_fill_style_str("rgba(0,0,0,0.6)");
     ctx.fill_rect(0.0, 0.0, cw, ch);
     ctx.set_text_align("center");
@@ -571,16 +585,14 @@ fn request_animation_frame(f: &Closure<dyn FnMut(f64)>) {
 
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
-    ensure_sin_lut();
-
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
     let canvas: HtmlCanvasElement = document
         .get_element_by_id("game-canvas")
         .ok_or("no canvas")?
         .dyn_into()?;
-    canvas.set_width(canvas_width().to_f64() as u32);
-    canvas.set_height(canvas_height().to_f64() as u32);
+    canvas.set_width(canvas_width().to_num::<f64>() as u32);
+    canvas.set_height(canvas_height().to_num::<f64>() as u32);
     let ctx: CanvasRenderingContext2d = canvas.get_context("2d")?.ok_or("no 2d ctx")?.dyn_into()?;
     let game = Rc::new(RefCell::new(Game::new()));
     let perf = window.performance().ok_or("no perf")?;
@@ -593,8 +605,8 @@ pub fn start() -> Result<(), JsValue> {
         let cw = canvas_width();
         let cl = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
             let r = el.get_bounding_client_rect();
-            let scale = cw / Fixed::from_f64(r.width());
-            let mouse_x = Fixed::from_f64(e.client_x() as f64 - r.left()) * scale;
+            let scale = cw / Fp::from_num(r.width());
+            let mouse_x = Fp::from_num(e.client_x() as f64 - r.left()) * scale;
             g.borrow_mut().mouse_move(mouse_x);
         });
         canvas.add_event_listener_with_callback("mousemove", cl.as_ref().unchecked_ref())?;
@@ -639,7 +651,7 @@ pub fn start() -> Result<(), JsValue> {
     *f2.borrow_mut() = Some(Closure::new(move |_ts: f64| {
         let now = perf.now();
         let dt_secs = ((now - game.borrow().last_time) / 1000.0).min(0.05);
-        let dt = Fixed::from_f64(dt_secs);
+        let dt = Fp::from_num(dt_secs);
         game.borrow_mut().last_time = now;
         game.borrow_mut().update(dt);
         game.borrow().draw(&ctx);
